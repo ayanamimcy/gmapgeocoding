@@ -6,6 +6,7 @@
 
 - 解析 Google Maps 分享链接和跳转链接
 - 使用 Playwright 驱动 Chromium 等待前端重定向完成
+- 浏览器实例会在首次请求后复用，并在空闲 1 小时后自动关闭
 - 优先从最终 Google Maps URL 中提取经纬度
 - 当只有文本查询时，回退到 OSM Nominatim 做地理编码
 - 基于 `X-API-Key` 做简单鉴权
@@ -107,6 +108,7 @@ curl -X POST 'http://127.0.0.1:8000/resolve' \
 - `APP_API_KEY`: API 鉴权密钥，不能为空
 - `HEADLESS`: 是否以无头模式启动浏览器，默认 `true`
 - `PLAYWRIGHT_TIMEOUT_MS`: Playwright 页面加载超时时间
+- `BROWSER_IDLE_TTL_SECONDS`: 浏览器空闲多久后自动关闭，默认 `3600`
 - `BROWSER_USER_AGENT`: 浏览器 UA
 - `NOMINATIM_URL`: Nominatim 搜索接口地址
 - `COUNTRYCODES`: 限制地理编码国家代码，默认 `jp`

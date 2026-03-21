@@ -2,11 +2,14 @@ import hashlib
 import hmac
 import json
 import os
+import queue
 import re
 import sqlite3
+import threading
 import time
+from concurrent.futures import Future
 from contextlib import closing
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
@@ -19,6 +22,7 @@ from playwright.sync_api import sync_playwright
 APP_API_KEY = os.getenv("APP_API_KEY", "")
 HEADLESS = os.getenv("HEADLESS", "true").lower() != "false"
 PLAYWRIGHT_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_TIMEOUT_MS", "25000"))
+BROWSER_IDLE_TTL_SECONDS = int(os.getenv("BROWSER_IDLE_TTL_SECONDS", "3600"))
 NOMINATIM_URL = os.getenv("NOMINATIM_URL", "https://nominatim.openstreetmap.org/search")
 COUNTRYCODES = os.getenv("COUNTRYCODES", "jp")
 
@@ -108,6 +112,12 @@ def cleanup_db(now_ts: Optional[int] = None) -> None:
 def on_startup() -> None:
     init_db()
     cleanup_db()
+    browser_manager.start()
+
+
+@app.on_event("shutdown")
+def on_shutdown() -> None:
+    browser_manager.shutdown()
 
 
 def normalize_url(url: str) -> str:
@@ -301,12 +311,173 @@ def maybe_accept_google_dialogs(page) -> None:
             pass
 
 
-def resolve_with_playwright(url: str) -> dict:
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=HEADLESS)
-        context = browser.new_context(user_agent=BROWSER_USER_AGENT, locale="ja-JP")
-        page = context.new_page()
+class BrowserManager:
+    def __init__(self, idle_ttl_seconds: int):
+        self.idle_ttl_seconds = idle_ttl_seconds
+        self._jobs: queue.Queue[tuple[str, Optional[str], Optional[Future]]] = queue.Queue()
+        self._stop_event = threading.Event()
+        self._start_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._worker: Optional[threading.Thread] = None
+        self._browser_active = False
+        self._browser_started_at: Optional[int] = None
+        self._last_used_at: Optional[int] = None
+        self._last_used_monotonic: Optional[float] = None
 
+    def start(self) -> None:
+        with self._start_lock:
+            if self._worker and self._worker.is_alive():
+                return
+            self._stop_event.clear()
+            self._worker = threading.Thread(
+                target=self._worker_loop,
+                name="playwright-browser-manager",
+                daemon=True,
+            )
+            self._worker.start()
+
+    def shutdown(self) -> None:
+        worker = None
+        with self._start_lock:
+            worker = self._worker
+            if not worker:
+                return
+            self._stop_event.set()
+            self._jobs.put(("shutdown", None, None))
+            self._worker = None
+
+        worker.join(timeout=10)
+        with self._state_lock:
+            self._browser_active = False
+            self._browser_started_at = None
+            self._last_used_at = None
+            self._last_used_monotonic = None
+
+    def resolve(self, url: str) -> dict:
+        self.start()
+        future: Future = Future()
+        self._jobs.put(("resolve", url, future))
+        return future.result()
+
+    def snapshot(self) -> dict:
+        with self._state_lock:
+            worker_running = bool(self._worker and self._worker.is_alive())
+            return {
+                "browser_worker_running": worker_running,
+                "browser_active": self._browser_active,
+                "browser_started_at": self._browser_started_at,
+                "browser_last_used_at": self._last_used_at,
+            }
+
+    def _mark_browser_open(self) -> None:
+        now_monotonic = time.monotonic()
+        now_ts = int(time.time())
+        with self._state_lock:
+            self._browser_active = True
+            self._browser_started_at = now_ts
+            self._last_used_at = now_ts
+            self._last_used_monotonic = now_monotonic
+
+    def _mark_browser_used(self) -> None:
+        now_monotonic = time.monotonic()
+        now_ts = int(time.time())
+        with self._state_lock:
+            self._last_used_at = now_ts
+            self._last_used_monotonic = now_monotonic
+
+    def _mark_browser_closed(self) -> None:
+        with self._state_lock:
+            self._browser_active = False
+            self._browser_started_at = None
+            self._last_used_at = None
+            self._last_used_monotonic = None
+
+    def _worker_loop(self) -> None:
+        playwright = None
+        browser = None
+
+        try:
+            while True:
+                try:
+                    action, payload, future = self._jobs.get(timeout=5)
+                except queue.Empty:
+                    browser, playwright = self._close_browser_if_idle(browser, playwright)
+                    if self._stop_event.is_set():
+                        break
+                    continue
+
+                if action == "shutdown":
+                    break
+
+                if action != "resolve" or future is None or payload is None:
+                    continue
+
+                try:
+                    browser, playwright = self._ensure_browser(browser, playwright)
+                    self._mark_browser_used()
+                    result = resolve_with_browser(browser, payload)
+                    self._mark_browser_used()
+                    future.set_result(result)
+                except Exception as exc:
+                    browser, playwright = self._close_browser(browser, playwright)
+                    future.set_exception(exc)
+        finally:
+            self._close_browser(browser, playwright)
+
+    def _ensure_browser(self, browser: Any, playwright: Any) -> tuple[Any, Any]:
+        if browser is not None and playwright is not None:
+            return browser, playwright
+
+        playwright = sync_playwright().start()
+        try:
+            browser = playwright.chromium.launch(headless=HEADLESS)
+        except Exception:
+            playwright.stop()
+            raise
+        self._mark_browser_open()
+        return browser, playwright
+
+    def _close_browser_if_idle(self, browser: Any, playwright: Any) -> tuple[Any, Any]:
+        if browser is None or playwright is None:
+            return browser, playwright
+
+        with self._state_lock:
+            last_used_monotonic = self._last_used_monotonic
+
+        if last_used_monotonic is None:
+            return self._close_browser(browser, playwright)
+
+        if (time.monotonic() - last_used_monotonic) < self.idle_ttl_seconds:
+            return browser, playwright
+
+        return self._close_browser(browser, playwright)
+
+    def _close_browser(self, browser: Any, playwright: Any) -> tuple[None, None]:
+        try:
+            try:
+                if browser is not None:
+                    browser.close()
+            except Exception:
+                pass
+        finally:
+            try:
+                if playwright is not None:
+                    playwright.stop()
+            except Exception:
+                pass
+            self._mark_browser_closed()
+
+        return None, None
+
+
+browser_manager = BrowserManager(idle_ttl_seconds=BROWSER_IDLE_TTL_SECONDS)
+
+
+def resolve_with_browser(browser: Any, url: str) -> dict:
+    context = browser.new_context(user_agent=BROWSER_USER_AGENT, locale="ja-JP")
+    page = context.new_page()
+
+    try:
         visited_urls: list[str] = []
         page.on("framenavigated", lambda frame: visited_urls.append(frame.url) if frame == page.main_frame else None)
 
@@ -330,7 +501,8 @@ def resolve_with_playwright(url: str) -> dict:
 
         final_url = page.url
         page_title = page.title()
-        browser.close()
+    finally:
+        context.close()
 
     result = {
         "original_url": url,
@@ -375,12 +547,15 @@ def resolve_with_playwright(url: str) -> dict:
 
 @app.get("/healthz")
 def healthz():
+    browser_status = browser_manager.snapshot()
     return {
         "ok": True,
         "db_path": CACHE_DB_PATH,
         "cache_ttl_seconds": CACHE_TTL_SECONDS,
         "rate_limit_window_seconds": RATE_LIMIT_WINDOW_SECONDS,
         "rate_limit_max_requests": RATE_LIMIT_MAX_REQUESTS,
+        "browser_idle_ttl_seconds": BROWSER_IDLE_TTL_SECONDS,
+        **browser_status,
     }
 
 
@@ -393,7 +568,7 @@ def resolve(payload: ResolveRequest):
         return cached
 
     try:
-        result = resolve_with_playwright(normalized_url)
+        result = browser_manager.resolve(normalized_url)
         set_cached_response(normalized_url, result)
         if int(time.time()) % 20 == 0:
             cleanup_db()

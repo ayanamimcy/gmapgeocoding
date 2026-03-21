@@ -57,6 +57,7 @@ RUN mkdir -p /app/data
 ENV APP_API_KEY=change-me \
     HEADLESS=true \
     PLAYWRIGHT_TIMEOUT_MS=25000 \
+    BROWSER_IDLE_TTL_SECONDS=3600 \
     NOMINATIM_URL=https://nominatim.openstreetmap.org/search \
     COUNTRYCODES=jp \
     NOMINATIM_UA="gmaps-resolver/1.0 (contact: you@example.com)" \
