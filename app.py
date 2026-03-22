@@ -19,11 +19,23 @@ from pydantic import BaseModel, Field
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
+
+def default_reverse_geocode_url(search_url: str) -> str:
+    normalized = search_url.rstrip("/")
+    if normalized.endswith("/search"):
+        return f"{normalized[:-len('/search')]}/reverse"
+    return f"{normalized}/reverse"
+
+
 APP_API_KEY = os.getenv("APP_API_KEY", "")
 HEADLESS = os.getenv("HEADLESS", "true").lower() != "false"
 PLAYWRIGHT_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_TIMEOUT_MS", "25000"))
-BROWSER_IDLE_TTL_SECONDS = int(os.getenv("BROWSER_IDLE_TTL_SECONDS", "3600"))
+BROWSER_RESTART_INTERVAL_SECONDS = int(os.getenv("BROWSER_RESTART_INTERVAL_SECONDS", "7200"))
 NOMINATIM_URL = os.getenv("NOMINATIM_URL", "https://nominatim.openstreetmap.org/search")
+OPENMAPAPI_REVERSE_URL = os.getenv(
+    "OPENMAPAPI_REVERSE_URL",
+    default_reverse_geocode_url(NOMINATIM_URL),
+)
 COUNTRYCODES = os.getenv("COUNTRYCODES", "jp")
 
 CACHE_DB_PATH = os.getenv("CACHE_DB_PATH", "./data/gmaps_resolver.db")
@@ -47,6 +59,13 @@ class ResolveRequest(BaseModel):
     url: str = Field(..., description="Google Maps share URL")
 
 
+class ReverseGeocodeResult(BaseModel):
+    source: str
+    display_name: Optional[str] = None
+    address: Optional[dict[str, Any]] = None
+    raw: Optional[dict[str, Any]] = None
+
+
 class ResolveResponse(BaseModel):
     original_url: str
     final_url: str
@@ -58,6 +77,7 @@ class ResolveResponse(BaseModel):
     lat: Optional[float] = None
     lon: Optional[float] = None
     display_name: Optional[str] = None
+    reverse_geocode: Optional[ReverseGeocodeResult] = None
     error: Optional[str] = None
     cache_hit: bool = False
     cached_at: Optional[int] = None
@@ -94,8 +114,23 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reverse_geocode_results (
+                url_hash TEXT PRIMARY KEY,
+                url TEXT NOT NULL,
+                final_url TEXT NOT NULL,
+                lat REAL NOT NULL,
+                lon REAL NOT NULL,
+                reverse_geocode_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_expires_at ON cache_entries(expires_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rate_limit_bucket_ts ON rate_limit_events(bucket_key, ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_reverse_geocode_lat_lon ON reverse_geocode_results(lat, lon)")
         conn.commit()
 
 
@@ -128,6 +163,14 @@ def hash_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def is_failed_response(response: dict) -> bool:
+    return bool(response.get("error"))
+
+
+def has_coordinates(response: dict) -> bool:
+    return response.get("lat") is not None and response.get("lon") is not None
+
+
 def get_cached_response(url: str) -> Optional[dict]:
     normalized = normalize_url(url)
     url_hash = hash_text(normalized)
@@ -142,16 +185,24 @@ def get_cached_response(url: str) -> Optional[dict]:
             (url_hash, now_ts),
         ).fetchone()
 
-    if not row:
-        return None
+        if not row:
+            return None
 
-    data = json.loads(row["response_json"])
+        data = json.loads(row["response_json"])
+        if is_failed_response(data):
+            conn.execute("DELETE FROM cache_entries WHERE url_hash = ?", (url_hash,))
+            conn.commit()
+            return None
+
     data["cache_hit"] = True
     data["cached_at"] = row["created_at"]
     return data
 
 
 def set_cached_response(url: str, response: dict) -> None:
+    if is_failed_response(response):
+        return
+
     normalized = normalize_url(url)
     url_hash = hash_text(normalized)
     now_ts = int(time.time())
@@ -173,6 +224,44 @@ def set_cached_response(url: str, response: dict) -> None:
                 expires_at = excluded.expires_at
             """,
             (url_hash, normalized, json.dumps(cacheable, ensure_ascii=False), now_ts, expires_at),
+        )
+        conn.commit()
+
+
+def save_reverse_geocode_result(url: str, response: dict) -> None:
+    reverse_geocode = response.get("reverse_geocode")
+    if not reverse_geocode or not has_coordinates(response):
+        return
+
+    normalized = normalize_url(url)
+    url_hash = hash_text(normalized)
+    now_ts = int(time.time())
+
+    with closing(get_db()) as conn:
+        conn.execute(
+            """
+            INSERT INTO reverse_geocode_results (
+                url_hash, url, final_url, lat, lon, reverse_geocode_json, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(url_hash) DO UPDATE SET
+                url = excluded.url,
+                final_url = excluded.final_url,
+                lat = excluded.lat,
+                lon = excluded.lon,
+                reverse_geocode_json = excluded.reverse_geocode_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                url_hash,
+                normalized,
+                response["final_url"],
+                float(response["lat"]),
+                float(response["lon"]),
+                json.dumps(reverse_geocode, ensure_ascii=False),
+                now_ts,
+                now_ts,
+            ),
         )
         conn.commit()
 
@@ -281,7 +370,7 @@ def nominatim_search(query: str) -> Optional[dict]:
     )
     r.raise_for_status()
     data = r.json()
-    if not data:
+    if not data or data.get("error"):
         return None
     first = data[0]
     return {
@@ -290,6 +379,49 @@ def nominatim_search(query: str) -> Optional[dict]:
         "display_name": first.get("display_name"),
         "raw": first,
     }
+
+
+def openmapapi_reverse_geocode(lat: float, lon: float) -> Optional[dict]:
+    r = requests.get(
+        OPENMAPAPI_REVERSE_URL,
+        params={
+            "lat": lat,
+            "lon": lon,
+            "format": "jsonv2",
+            "addressdetails": 1,
+            "accept-language": "ja,en",
+        },
+        headers={"User-Agent": NOMINATIM_UA},
+        timeout=20,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if not data:
+        return None
+
+    return {
+        "source": "openmapapi",
+        "display_name": data.get("display_name"),
+        "address": data.get("address"),
+        "raw": data,
+    }
+
+
+def enrich_successful_response(url: str, response: dict) -> dict:
+    if not has_coordinates(response):
+        return response
+
+    enriched = dict(response)
+    if not enriched.get("reverse_geocode"):
+        reverse_geocode = openmapapi_reverse_geocode(
+            float(enriched["lat"]),
+            float(enriched["lon"]),
+        )
+        if reverse_geocode:
+            enriched["reverse_geocode"] = reverse_geocode
+
+    save_reverse_geocode_result(url, enriched)
+    return enriched
 
 
 def maybe_accept_google_dialogs(page) -> None:
@@ -312,8 +444,8 @@ def maybe_accept_google_dialogs(page) -> None:
 
 
 class BrowserManager:
-    def __init__(self, idle_ttl_seconds: int):
-        self.idle_ttl_seconds = idle_ttl_seconds
+    def __init__(self, restart_interval_seconds: int):
+        self.restart_interval_seconds = restart_interval_seconds
         self._jobs: queue.Queue[tuple[str, Optional[str], Optional[Future]]] = queue.Queue()
         self._stop_event = threading.Event()
         self._start_lock = threading.Lock()
@@ -321,10 +453,11 @@ class BrowserManager:
         self._worker: Optional[threading.Thread] = None
         self._browser_active = False
         self._browser_started_at: Optional[int] = None
+        self._browser_started_monotonic: Optional[float] = None
         self._last_used_at: Optional[int] = None
-        self._last_used_monotonic: Optional[float] = None
 
     def start(self) -> None:
+        warmup_future: Optional[Future] = None
         with self._start_lock:
             if self._worker and self._worker.is_alive():
                 return
@@ -335,6 +468,10 @@ class BrowserManager:
                 daemon=True,
             )
             self._worker.start()
+            warmup_future = Future()
+            self._jobs.put(("warmup", None, warmup_future))
+
+        warmup_future.result(timeout=60)
 
     def shutdown(self) -> None:
         worker = None
@@ -350,8 +487,8 @@ class BrowserManager:
         with self._state_lock:
             self._browser_active = False
             self._browser_started_at = None
+            self._browser_started_monotonic = None
             self._last_used_at = None
-            self._last_used_monotonic = None
 
     def resolve(self, url: str) -> dict:
         self.start()
@@ -375,22 +512,20 @@ class BrowserManager:
         with self._state_lock:
             self._browser_active = True
             self._browser_started_at = now_ts
+            self._browser_started_monotonic = now_monotonic
             self._last_used_at = now_ts
-            self._last_used_monotonic = now_monotonic
 
     def _mark_browser_used(self) -> None:
-        now_monotonic = time.monotonic()
         now_ts = int(time.time())
         with self._state_lock:
             self._last_used_at = now_ts
-            self._last_used_monotonic = now_monotonic
 
     def _mark_browser_closed(self) -> None:
         with self._state_lock:
             self._browser_active = False
             self._browser_started_at = None
+            self._browser_started_monotonic = None
             self._last_used_at = None
-            self._last_used_monotonic = None
 
     def _worker_loop(self) -> None:
         playwright = None
@@ -401,26 +536,39 @@ class BrowserManager:
                 try:
                     action, payload, future = self._jobs.get(timeout=5)
                 except queue.Empty:
-                    browser, playwright = self._close_browser_if_idle(browser, playwright)
                     if self._stop_event.is_set():
                         break
+                    try:
+                        browser, playwright = self._restart_browser_if_due(browser, playwright)
+                        browser, playwright = self._ensure_browser(browser, playwright)
+                    except Exception:
+                        browser, playwright = self._close_browser(browser, playwright)
                     continue
 
                 if action == "shutdown":
                     break
 
-                if action != "resolve" or future is None or payload is None:
+                if action not in {"warmup", "resolve"}:
                     continue
 
                 try:
+                    browser, playwright = self._restart_browser_if_due(browser, playwright)
                     browser, playwright = self._ensure_browser(browser, playwright)
+                    if action == "warmup":
+                        if future is not None:
+                            future.set_result(None)
+                        continue
+
+                    if future is None or payload is None:
+                        continue
                     self._mark_browser_used()
                     result = resolve_with_browser(browser, payload)
                     self._mark_browser_used()
                     future.set_result(result)
                 except Exception as exc:
                     browser, playwright = self._close_browser(browser, playwright)
-                    future.set_exception(exc)
+                    if future is not None:
+                        future.set_exception(exc)
         finally:
             self._close_browser(browser, playwright)
 
@@ -437,17 +585,17 @@ class BrowserManager:
         self._mark_browser_open()
         return browser, playwright
 
-    def _close_browser_if_idle(self, browser: Any, playwright: Any) -> tuple[Any, Any]:
+    def _restart_browser_if_due(self, browser: Any, playwright: Any) -> tuple[Any, Any]:
         if browser is None or playwright is None:
             return browser, playwright
 
         with self._state_lock:
-            last_used_monotonic = self._last_used_monotonic
+            browser_started_monotonic = self._browser_started_monotonic
 
-        if last_used_monotonic is None:
+        if browser_started_monotonic is None:
             return self._close_browser(browser, playwright)
 
-        if (time.monotonic() - last_used_monotonic) < self.idle_ttl_seconds:
+        if (time.monotonic() - browser_started_monotonic) < self.restart_interval_seconds:
             return browser, playwright
 
         return self._close_browser(browser, playwright)
@@ -470,7 +618,7 @@ class BrowserManager:
         return None, None
 
 
-browser_manager = BrowserManager(idle_ttl_seconds=BROWSER_IDLE_TTL_SECONDS)
+browser_manager = BrowserManager(restart_interval_seconds=BROWSER_RESTART_INTERVAL_SECONDS)
 
 
 def resolve_with_browser(browser: Any, url: str) -> dict:
@@ -515,6 +663,7 @@ def resolve_with_browser(browser: Any, url: str) -> dict:
         "lat": None,
         "lon": None,
         "display_name": None,
+        "reverse_geocode": None,
         "error": None,
         "cache_hit": False,
         "cached_at": None,
@@ -552,9 +701,10 @@ def healthz():
         "ok": True,
         "db_path": CACHE_DB_PATH,
         "cache_ttl_seconds": CACHE_TTL_SECONDS,
+        "openmapapi_reverse_url": OPENMAPAPI_REVERSE_URL,
         "rate_limit_window_seconds": RATE_LIMIT_WINDOW_SECONDS,
         "rate_limit_max_requests": RATE_LIMIT_MAX_REQUESTS,
-        "browser_idle_ttl_seconds": BROWSER_IDLE_TTL_SECONDS,
+        "browser_restart_interval_seconds": BROWSER_RESTART_INTERVAL_SECONDS,
         **browser_status,
     }
 
@@ -565,10 +715,14 @@ def resolve(payload: ResolveRequest):
 
     cached = get_cached_response(normalized_url)
     if cached:
-        return cached
+        enriched_cached = enrich_successful_response(normalized_url, cached)
+        if enriched_cached != cached:
+            set_cached_response(normalized_url, enriched_cached)
+        return enriched_cached
 
     try:
         result = browser_manager.resolve(normalized_url)
+        result = enrich_successful_response(normalized_url, result)
         set_cached_response(normalized_url, result)
         if int(time.time()) % 20 == 0:
             cleanup_db()

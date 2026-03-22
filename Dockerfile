@@ -59,6 +59,7 @@ ENV APP_API_KEY=change-me \
     PLAYWRIGHT_TIMEOUT_MS=25000 \
     BROWSER_IDLE_TTL_SECONDS=3600 \
     NOMINATIM_URL=https://nominatim.openstreetmap.org/search \
+    OPENMAPAPI_REVERSE_URL=https://nominatim.openstreetmap.org/reverse \
     COUNTRYCODES=jp \
     NOMINATIM_UA="gmaps-resolver/1.0 (contact: you@example.com)" \
     CACHE_DB_PATH=/app/data/gmaps_resolver.db \
