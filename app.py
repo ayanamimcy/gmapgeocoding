@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import logging
 import os
 import queue
 import re
@@ -53,6 +54,7 @@ BROWSER_USER_AGENT = os.getenv(
 
 app = FastAPI(title="Google Maps Share Link Resolver", version="1.1.0")
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+logger = logging.getLogger("uvicorn.error")
 
 
 class ResolveRequest(BaseModel):
@@ -171,32 +173,8 @@ def has_coordinates(response: dict) -> bool:
     return response.get("lat") is not None and response.get("lon") is not None
 
 
-def get_cached_response(url: str) -> Optional[dict]:
-    normalized = normalize_url(url)
-    url_hash = hash_text(normalized)
-    now_ts = int(time.time())
-    with closing(get_db()) as conn:
-        row = conn.execute(
-            """
-            SELECT response_json, created_at
-            FROM cache_entries
-            WHERE url_hash = ? AND expires_at > ?
-            """,
-            (url_hash, now_ts),
-        ).fetchone()
-
-        if not row:
-            return None
-
-        data = json.loads(row["response_json"])
-        if is_failed_response(data):
-            conn.execute("DELETE FROM cache_entries WHERE url_hash = ?", (url_hash,))
-            conn.commit()
-            return None
-
-    data["cache_hit"] = True
-    data["cached_at"] = row["created_at"]
-    return data
+def to_log_json(data: Any) -> str:
+    return json.dumps(data, ensure_ascii=False, default=str)
 
 
 def set_cached_response(url: str, response: dict) -> None:
@@ -712,22 +690,23 @@ def healthz():
 @app.post("/resolve", response_model=ResolveResponse, dependencies=[Depends(verify_api_key_and_rate_limit)])
 def resolve(payload: ResolveRequest):
     normalized_url = normalize_url(payload.url)
-
-    cached = get_cached_response(normalized_url)
-    if cached:
-        enriched_cached = enrich_successful_response(normalized_url, cached)
-        if enriched_cached != cached:
-            set_cached_response(normalized_url, enriched_cached)
-        return enriched_cached
+    log_input = {
+        "url": payload.url,
+        "normalized_url": normalized_url,
+    }
+    logger.info("resolve input=%s", to_log_json(log_input))
 
     try:
         result = browser_manager.resolve(normalized_url)
         result = enrich_successful_response(normalized_url, result)
         set_cached_response(normalized_url, result)
+        logger.info("resolve output=%s", to_log_json(result))
         if int(time.time()) % 20 == 0:
             cleanup_db()
         return result
     except requests.HTTPError as e:
+        logger.exception("resolve upstream_error input=%s", to_log_json(log_input))
         raise HTTPException(status_code=502, detail=f"Upstream geocoding error: {e}")
     except Exception as e:
+        logger.exception("resolve error input=%s", to_log_json(log_input))
         raise HTTPException(status_code=500, detail=f"Resolver error: {e}")
