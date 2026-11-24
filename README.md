@@ -5,9 +5,9 @@
 ## 功能
 
 - 解析 Google Maps 分享链接和跳转链接
-- 使用 Playwright 驱动 Chromium 等待前端重定向完成
+- 对 `maps.app.goo.gl` 短链先尝试 HTTP 重定向；只有目标 URL 包含可确认的目的地坐标才走快路径，否则回退到 Playwright
 - 浏览器实例会在服务启动时立即拉起，并每 2 小时自动重启一次
-- 优先从最终 Google Maps URL 中提取经纬度
+- 从显式图钉或单一地点记录提取目的地坐标，不把 `@lat,lon`、`center` 或 `ll` 视口坐标当作目的地
 - 当只有文本查询时，回退到 OSM Nominatim 做地理编码
 - 解析成功后会基于坐标调用 OpenMap 反解析接口，并将结果落到 SQLite
 - 基于 `X-API-Key` 做简单鉴权
@@ -109,6 +109,8 @@ curl -X POST 'http://127.0.0.1:8000/resolve' \
 - `APP_API_KEY`: API 鉴权密钥，不能为空
 - `HEADLESS`: 是否以无头模式启动浏览器，默认 `true`
 - `PLAYWRIGHT_TIMEOUT_MS`: Playwright 页面加载超时时间
+- `HTTP_FAST_RESOLVE`: 短链 HTTP 快路径，默认 `true`；设为 `false` 可用相同坐标规则对比只走 Playwright 的耗时
+- `HTTP_FAST_RESOLVE_TIMEOUT_SECONDS`: 快路径的 HTTP 超时预算，默认 `2` 秒；最多发出 3 次 HTTP 请求
 - `BROWSER_RESTART_INTERVAL_SECONDS`: 浏览器进程重启间隔，默认 `7200`
 - `BROWSER_USER_AGENT`: 浏览器 UA
 - `NOMINATIM_URL`: Nominatim 搜索接口地址
@@ -119,6 +121,18 @@ curl -X POST 'http://127.0.0.1:8000/resolve' \
 - `CACHE_TTL_SECONDS`: 缓存有效期，默认 30 天
 - `RATE_LIMIT_MAX_REQUESTS`: 限流窗口内最大请求数
 - `RATE_LIMIT_WINDOW_SECONDS`: 限流窗口时长
+
+## 解析耗时
+
+每次进入 `/resolve` 处理函数后，服务会输出一条 `resolve timings=` JSON 日志。`total_ms` 是处理函数耗时，不含鉴权和响应传输；`stages_ms` 只包含实际执行的阶段（即使阶段失败也会计时）：
+
+- `http_expand`：尝试通过 HTTP 重定向展开短链；命中时响应的 `method` 为 `direct_google_http_redirect`，`title` 为 `null`（未打开网页）。
+- `browser_worker_start` / `browser_queue` / `browser_prepare`：检查或启动 worker、等待排队、准备或重启浏览器。
+- `browser_context` / `browser_navigation` / `browser_wait`：创建和关闭页面上下文、打开链接直到 DOM 就绪、处理弹窗并等待最终 URL。
+- `forward_geocoding` / `reverse_geocoding`：上游正查和反查耗时。
+- `sqlite`：结果写入和当次触发的清理耗时。
+
+计时日志不包含 URL 或地址，原有请求及结果日志不变。
 
 ## Git 初始化
 
